@@ -4,7 +4,7 @@ Local browser dashboard for tmux panes used by AI coding agents and long-running
 
 ## Problem
 
-AI coding workflows, including Codex-style agents and Claude Code, often use tmux to keep multiple background tasks alive: tests, dev servers, installs, remote shells, and long-running automation. Tmux is reliable for background execution, but it is not very visual.
+Terminal-based AI coding agents such as Codex CLI and Claude Code often use tmux to keep multiple background tasks alive: tests, dev servers, installs, remote shells, and long-running automation. Tmux is reliable for background execution, but it is not very visual.
 
 When several sessions are running at the same time, it can be hard to quickly understand what the agent is doing:
 
