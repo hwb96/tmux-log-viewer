@@ -1,0 +1,12 @@
+{
+  "name": "tmux-log-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Readonly local browser dashboard for tmux pane output.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "license": "UNLICENSED"
+}
