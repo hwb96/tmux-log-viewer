@@ -3,6 +3,145 @@ const http = require("node:http");
 
 const tmuxModule = require("./src/tmux");
 
+const SSH_DISCONNECT_PATTERN = /\b(?:Connection to .+ closed|client_loop: send disconnect|Broken pipe|Connection reset by peer|Connection timed out|Operation timed out|Connection refused|No route to host|kex_exchange_identification: Connection closed by remote host|packet_write_wait: Connection to .+ Broken pipe)\b/i;
+
+function isSshCommand(command) {
+  const value = String(command || "").trim().toLowerCase();
+  return value === "ssh" || value.endsWith("/ssh");
+}
+
+function hasSshTitle(title) {
+  return String(title || "").trim().toLowerCase().startsWith("ssh://");
+}
+
+function hasSshDisconnectSignal(logText) {
+  return SSH_DISCONNECT_PATTERN.test(String(logText || ""));
+}
+
+function getPaneConnectionState(pane, knownSshPaneIds = {}, selectedPaneId = "", selectedLog = "") {
+  if (!pane || !pane.paneId) return "none";
+  if (pane.paneId === selectedPaneId && hasSshDisconnectSignal(selectedLog)) return "disconnected";
+  if (isSshCommand(pane.command) || hasSshTitle(pane.title)) return "connected";
+  if (knownSshPaneIds[pane.paneId]) return "disconnected";
+  return "none";
+}
+
+const CLIENT_SSH_STATUS_SCRIPT = `
+    const SSH_DISCONNECT_PATTERN = ${SSH_DISCONNECT_PATTERN};
+    ${isSshCommand.toString()}
+    ${hasSshTitle.toString()}
+    ${hasSshDisconnectSignal.toString()}
+    ${getPaneConnectionState.toString()}
+`;
+
+const SHELL_PROMPT_PATTERN = /^((?:\([^)]+\)\s*)?[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+(?:(?::[^%$#\s]+)|(?:\s+[^%$#]*?))?\s*[%$#])(?:\s+(.*))?$/;
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, function (char) {
+    return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char];
+  });
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^$()|[\]\\]/g, "\\$&");
+}
+
+function splitPromptCommand(line) {
+  const shellMatch = String(line).match(SHELL_PROMPT_PATTERN);
+  if (shellMatch) {
+    return {
+      head: shellMatch[1] + (shellMatch[2] ? " " : ""),
+      command: shellMatch[2] || "",
+    };
+  }
+
+  const simpleMatch = String(line).match(/^((?:[$%#]|heredoc>)\s+)(.*)$/);
+  if (simpleMatch) {
+    return { head: simpleMatch[1], command: simpleMatch[2] };
+  }
+
+  return null;
+}
+
+function classifyLogLine(line, state) {
+  const trimmed = line.trim();
+  if (!trimmed) return "";
+
+  if (/^(root|[A-Za-z0-9_.-]+) at [A-Za-z0-9_.-]+ in /.test(trimmed)) {
+    state.afterCommand = false;
+    return "prompt-remote";
+  }
+
+  const promptCommand = splitPromptCommand(trimmed);
+  if (promptCommand && promptCommand.command) {
+    state.afterCommand = true;
+    return promptCommand.head.startsWith("heredoc>") ? "prompt-command command-input" : "prompt-local command-input";
+  }
+  if (promptCommand) {
+    state.afterCommand = false;
+    return "prompt-local";
+  }
+
+  if (state.afterCommand) {
+    return "command-output";
+  }
+  return "";
+}
+
+function renderSearchText(value, query) {
+  if (!query) return escapeHtml(value);
+
+  const pattern = new RegExp(escapeRegExp(query), "gi");
+  let html = "";
+  let lastIndex = 0;
+  for (const match of String(value).matchAll(pattern)) {
+    html += escapeHtml(String(value).slice(lastIndex, match.index));
+    html += "<mark>" + escapeHtml(match[0]) + "</mark>";
+    lastIndex = match.index + match[0].length;
+  }
+  html += escapeHtml(String(value).slice(lastIndex));
+  return html;
+}
+
+function renderPromptCommandLine(line, query) {
+  const promptCommand = splitPromptCommand(line);
+  if (!promptCommand || !promptCommand.command) return renderSearchText(line, query);
+
+  return (
+    '<span class="prompt-head">' +
+    renderSearchText(promptCommand.head, query) +
+    '</span><span class="command-text">' +
+    renderSearchText(promptCommand.command, query) +
+    "</span>"
+  );
+}
+
+function renderLogLine(line, query, renderState) {
+  const lineClass = classifyLogLine(line, renderState);
+  const className = ["log-line", lineClass].filter(Boolean).join(" ");
+  const html = lineClass.includes("command-input") ? renderPromptCommandLine(line, query) : renderSearchText(line, query);
+  return '<span class="' + className + '">' + html + "</span>";
+}
+
+function renderHighlightedLog(value, query) {
+  const renderState = { afterCommand: false };
+  return String(value).split("\n").map(function (line) {
+    return renderLogLine(line, query, renderState);
+  }).join("");
+}
+
+const CLIENT_LOG_RENDERING_SCRIPT = `
+    const SHELL_PROMPT_PATTERN = ${SHELL_PROMPT_PATTERN};
+    ${escapeHtml.toString()}
+    ${escapeRegExp.toString()}
+    ${splitPromptCommand.toString()}
+    ${classifyLogLine.toString()}
+    ${renderSearchText.toString()}
+    ${renderPromptCommandLine.toString()}
+    ${renderLogLine.toString()}
+    ${renderHighlightedLog.toString()}
+`;
+
 const HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -26,7 +165,7 @@ const HTML = `<!doctype html>
     }
 
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
+    html, body { height: 100%; overflow: hidden; }
     body {
       margin: 0;
       background: var(--bg);
@@ -39,7 +178,8 @@ const HTML = `<!doctype html>
       display: grid;
       grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
       height: 100vh;
-      min-height: 520px;
+      min-height: 0;
+      overflow: hidden;
     }
 
     aside {
@@ -48,6 +188,8 @@ const HTML = `<!doctype html>
       display: grid;
       grid-template-rows: auto auto minmax(0, 1fr);
       min-width: 0;
+      min-height: 0;
+      overflow: hidden;
     }
 
     header {
@@ -115,6 +257,7 @@ const HTML = `<!doctype html>
 
     .pane-list {
       overflow: auto;
+      overscroll-behavior: contain;
       padding: 8px;
     }
 
@@ -166,6 +309,34 @@ const HTML = `<!doctype html>
       min-width: 0;
     }
 
+    .pane-name {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .connection-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+      display: inline-block;
+      border: 1px solid transparent;
+    }
+
+    .connection-connected {
+      background: #45d483;
+      border-color: #8bf0b4;
+      box-shadow: 0 0 0 2px rgba(69, 212, 131, 0.13);
+    }
+
+    .connection-disconnected {
+      background: #f05f66;
+      border-color: #ff9aa0;
+      box-shadow: 0 0 0 2px rgba(240, 95, 102, 0.13);
+    }
+
     .pane-label {
       overflow: hidden;
       text-overflow: ellipsis;
@@ -191,8 +362,10 @@ const HTML = `<!doctype html>
 
     main {
       min-width: 0;
+      min-height: 0;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
     }
 
     .toolbar {
@@ -223,6 +396,7 @@ const HTML = `<!doctype html>
 
     .log-wrap {
       min-height: 0;
+      overflow: hidden;
       background: #080b0e;
       position: relative;
     }
@@ -231,6 +405,7 @@ const HTML = `<!doctype html>
       margin: 0;
       height: 100%;
       overflow: auto;
+      overscroll-behavior: contain;
       padding: 14px 16px 28px;
       color: #d7dde5;
       font-family: var(--mono);
@@ -273,11 +448,24 @@ const HTML = `<!doctype html>
       background: rgba(79, 179, 200, 0.08);
     }
 
+    .prompt-head {
+      color: #8aa3b5;
+      font-weight: 700;
+    }
+
+    .prompt-command .prompt-head {
+      color: #eef6ff;
+    }
+
     .command-input {
       color: #b8f2e6;
       background: rgba(24, 134, 118, 0.18);
       border-left-color: #38c5aa;
       font-weight: 700;
+    }
+
+    .command-input .command-text {
+      color: #b8f2e6;
     }
 
     .command-output {
@@ -327,9 +515,55 @@ const HTML = `<!doctype html>
     </main>
   </div>
   <script>
+${CLIENT_SSH_STATUS_SCRIPT}
+${CLIENT_LOG_RENDERING_SCRIPT}
+    const KNOWN_SSH_PANES_KEY = "tmux-log-viewer:known-ssh-panes";
+
+    function readKnownSshPanes() {
+      try {
+        const value = JSON.parse(localStorage.getItem(KNOWN_SSH_PANES_KEY) || "{}");
+        return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+      } catch (error) {
+        return {};
+      }
+    }
+
+    function writeKnownSshPanes() {
+      localStorage.setItem(KNOWN_SSH_PANES_KEY, JSON.stringify(state.knownSshPanes));
+    }
+
+    function markKnownSshPane(paneId) {
+      if (!paneId || state.knownSshPanes[paneId]) return;
+      state.knownSshPanes[paneId] = true;
+      writeKnownSshPanes();
+    }
+
+    function updateKnownSshPanes(panes) {
+      const visiblePaneIds = {};
+      let changed = false;
+
+      for (const pane of panes) {
+        visiblePaneIds[pane.paneId] = true;
+        if (isSshCommand(pane.command) && !state.knownSshPanes[pane.paneId]) {
+          state.knownSshPanes[pane.paneId] = true;
+          changed = true;
+        }
+      }
+
+      for (const paneId of Object.keys(state.knownSshPanes)) {
+        if (!visiblePaneIds[paneId]) {
+          delete state.knownSshPanes[paneId];
+          changed = true;
+        }
+      }
+
+      if (changed) writeKnownSshPanes();
+    }
+
     const state = {
       panes: [],
       selected: localStorage.getItem("tmux-log-viewer:selected") || "",
+      knownSshPanes: readKnownSshPanes(),
       log: "",
       paused: false,
       loadingLog: false
@@ -345,75 +579,26 @@ const HTML = `<!doctype html>
     const copy = document.getElementById("copy");
     const autoScroll = document.getElementById("autoScroll");
 
-    function escapeHtml(value) {
-      return value.replace(/[&<>"']/g, function (char) {
-        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char];
-      });
-    }
-
-    function escapeRegExp(value) {
-      return value.replace(/[.*+?^$()|[\\]\\\\]/g, "\\\\$&");
-    }
-
     function setLogText(value, className) {
       log.className = className || "";
       log.textContent = value;
     }
 
-    function classifyLogLine(line, state) {
-      const trimmed = line.trim();
-      if (!trimmed) return "";
-
-      if (/^(root|[A-Za-z0-9_.-]+) at [A-Za-z0-9_.-]+ in /.test(trimmed)) {
-        state.afterCommand = false;
-        return "prompt-remote";
-      }
-      if (/^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+(?:\\s+[^%$#]*)?\\s[%$#](?:\\s|$)/.test(trimmed)) {
-        state.afterCommand = /[%$#]\\s+\\S/.test(trimmed);
-        return state.afterCommand ? "prompt-local command-input" : "prompt-local";
-      }
-      if (/^(?:[$%#]\\s|heredoc>\\s)/.test(trimmed)) {
-        state.afterCommand = true;
-        return "prompt-command command-input";
-      }
-      if (state.afterCommand) {
-        return "command-output";
-      }
-      return "";
+    function isLogNearBottom() {
+      return log.scrollHeight - log.scrollTop - log.clientHeight <= 24;
     }
 
-    function renderSearchText(value, query) {
-      if (!query) return escapeHtml(value);
-
-      const pattern = new RegExp(escapeRegExp(query), "gi");
-      let html = "";
-      let lastIndex = 0;
-      for (const match of value.matchAll(pattern)) {
-        html += escapeHtml(value.slice(lastIndex, match.index));
-        html += "<mark>" + escapeHtml(match[0]) + "</mark>";
-        lastIndex = match.index + match[0].length;
-      }
-      html += escapeHtml(value.slice(lastIndex));
-      return html;
-    }
-
-    function renderLogLine(line, query, renderState) {
-      const className = ["log-line", classifyLogLine(line, renderState)].filter(Boolean).join(" ");
-      return '<span class="' + className + '">' + renderSearchText(line, query) + '</span>';
-    }
-
-    function renderHighlightedLog(value, query) {
-      const renderState = { afterCommand: false };
-      return value.split("\\n").map(function (line) {
-        return renderLogLine(line, query, renderState);
-      }).join("");
-    }
-
-    function renderLog() {
+    function renderLog(forceScroll) {
+      const previousScrollTop = log.scrollTop;
+      const shouldFollow = Boolean(forceScroll) || (autoScroll.checked && isLogNearBottom());
       const query = search.value.trim();
       log.className = "";
       log.innerHTML = renderHighlightedLog(state.log || "No output captured.", query);
-      if (autoScroll.checked) log.scrollTop = log.scrollHeight;
+      if (shouldFollow) {
+        log.scrollTop = log.scrollHeight;
+      } else {
+        log.scrollTop = previousScrollTop;
+      }
     }
 
     function paneMatchesFilter(pane) {
@@ -423,6 +608,12 @@ const HTML = `<!doctype html>
         .join(" ")
         .toLowerCase()
         .includes(query);
+    }
+
+    function renderConnectionDot(connectionState) {
+      if (connectionState === "none") return "";
+      const label = connectionState === "connected" ? "SSH connected" : "SSH disconnected";
+      return '<span class="connection-dot connection-' + connectionState + '" role="img" aria-label="' + label + '" title="' + label + '"></span>';
     }
 
     function renderPanes() {
@@ -440,6 +631,7 @@ const HTML = `<!doctype html>
       }
 
       for (const pane of visible) {
+        const connectionState = getPaneConnectionState(pane, state.knownSshPanes, state.selected, state.log);
         const row = document.createElement("div");
         row.className = "pane-row";
 
@@ -448,7 +640,10 @@ const HTML = `<!doctype html>
         button.type = "button";
         button.innerHTML =
           '<span class="pane-primary">' +
+          '<span class="pane-name">' +
+          renderConnectionDot(connectionState) +
           '<span class="pane-label">' + escapeHtml(pane.label) + '</span>' +
+          '</span>' +
           '<span class="badge">' + escapeHtml(pane.paneId) + '</span>' +
           '</span>' +
           '<span class="pane-sub">' + escapeHtml((pane.command || "-") + " · " + (pane.title || "")) + '</span>';
@@ -503,6 +698,7 @@ const HTML = `<!doctype html>
         if (!response.ok) throw new Error("HTTP " + response.status);
         const payload = await response.json();
         state.panes = payload.panes || [];
+        updateKnownSshPanes(state.panes);
         if (!state.panes.some(function (pane) { return pane.paneId === state.selected; })) {
           state.selected = state.panes[0] ? state.panes[0].paneId : "";
         }
@@ -525,7 +721,9 @@ const HTML = `<!doctype html>
           throw new Error(payload.error || "HTTP " + response.status);
         }
         state.log = await response.text();
-        renderLog();
+        if (hasSshDisconnectSignal(state.log)) markKnownSshPane(state.selected);
+        renderLog(force);
+        renderPanes();
       } catch (error) {
         setLogText("Failed to capture " + state.selected + ": " + error.message, "error");
       } finally {
@@ -534,8 +732,11 @@ const HTML = `<!doctype html>
     }
 
     paneFilter.addEventListener("input", renderPanes);
-    search.addEventListener("input", renderLog);
+    search.addEventListener("input", function () { renderLog(false); });
     lines.addEventListener("change", function () { loadLog(true); });
+    autoScroll.addEventListener("change", function () {
+      if (autoScroll.checked) renderLog(true);
+    });
     pause.addEventListener("click", function () {
       state.paused = !state.paused;
       pause.textContent = state.paused ? "Resume" : "Pause";
@@ -644,5 +845,10 @@ if (require.main === module) {
 module.exports = {
   HTML,
   createServer,
+  getPaneConnectionState,
+  hasSshTitle,
+  hasSshDisconnectSignal,
+  isSshCommand,
+  renderHighlightedLog,
   start,
 };

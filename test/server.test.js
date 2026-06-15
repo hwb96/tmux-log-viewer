@@ -1,7 +1,14 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createServer } = require("../server");
+const {
+  createServer,
+  getPaneConnectionState,
+  hasSshTitle,
+  hasSshDisconnectSignal,
+  isSshCommand,
+  renderHighlightedLog,
+} = require("../server");
 
 function listen(server) {
   return new Promise((resolve) => {
@@ -200,6 +207,142 @@ test("GET / includes prompt-only log rendering styles", async () => {
     assert.match(html, /function classifyLogLine/);
     assert.match(html, /function renderLogLine/);
     assert.match(html, /function renderHighlightedLog/);
+  } finally {
+    await close(server);
+  }
+});
+
+test("renderHighlightedLog separates virtualenv shell prompt heads from typed commands", () => {
+  const html = renderHighlightedLog(
+    '(slj) hx-user@Tigermed-H100:~$ printf "__LS_CHECK_START__ host=%s\\\\n"',
+    "",
+  );
+
+  assert.match(html, /class="log-line prompt-local command-input"/);
+  assert.match(
+    html,
+    /<span class="prompt-head">\(slj\) hx-user@Tigermed-H100:~\$ <\/span><span class="command-text">printf/,
+  );
+});
+
+test("GET / keeps dashboard scrolling inside pane and log containers", async () => {
+  const server = createServer({
+    tmux: {
+      listPanes: async () => [],
+      capturePane: async () => "",
+    },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const response = await fetch(`${baseUrl}/`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /html, body \{ height: 100%; overflow: hidden; \}/);
+    assert.match(html, /\.app \{[\s\S]*height: 100vh;[\s\S]*overflow: hidden;/);
+    assert.match(html, /aside \{[\s\S]*min-height: 0;[\s\S]*overflow: hidden;/);
+    assert.match(html, /main \{[\s\S]*min-height: 0;[\s\S]*overflow: hidden;/);
+    assert.match(html, /\.pane-list \{[\s\S]*overscroll-behavior: contain;/);
+    assert.match(html, /pre \{[\s\S]*overscroll-behavior: contain;/);
+  } finally {
+    await close(server);
+  }
+});
+
+test("GET / only auto-scrolls logs while the user is already near the bottom", async () => {
+  const server = createServer({
+    tmux: {
+      listPanes: async () => [],
+      capturePane: async () => "",
+    },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const response = await fetch(`${baseUrl}/`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /function isLogNearBottom/);
+    assert.match(html, /function renderLog\(forceScroll\)/);
+    assert.match(html, /const shouldFollow = Boolean\(forceScroll\) \|\| \(autoScroll\.checked && isLogNearBottom\(\)\);/);
+    assert.match(html, /const previousScrollTop = log\.scrollTop;/);
+    assert.match(html, /log\.scrollTop = previousScrollTop;/);
+    assert.match(html, /renderLog\(force\);/);
+    assert.match(html, /autoScroll\.addEventListener\("change"/);
+  } finally {
+    await close(server);
+  }
+});
+
+test("SSH connection state is connected while ssh is the pane command", () => {
+  assert.equal(isSshCommand("ssh"), true);
+  assert.equal(getPaneConnectionState({ paneId: "%1", command: "ssh" }, {}, "%1", ""), "connected");
+});
+
+test("SSH connection state is connected while pane title is an ssh URL", () => {
+  assert.equal(hasSshTitle("ssh://hx-user@172.22.35.45"), true);
+  assert.equal(
+    getPaneConnectionState(
+      { paneId: "%1", command: "zsh", title: "ssh://hx-user@172.22.35.45" },
+      {},
+      "%1",
+      "",
+    ),
+    "connected",
+  );
+});
+
+test("SSH connection state treats disconnect output as stronger than an ssh title", () => {
+  const logText = "Connection to ydtunnel.tigermed.net closed by remote host.\nConnection to ydtunnel.tigermed.net closed.";
+
+  assert.equal(
+    getPaneConnectionState(
+      { paneId: "%1", command: "zsh", title: "ssh://hx-user@172.22.35.45" },
+      {},
+      "%1",
+      logText,
+    ),
+    "disconnected",
+  );
+});
+
+test("SSH connection state is disconnected after a known ssh pane returns to a shell", () => {
+  assert.equal(
+    getPaneConnectionState({ paneId: "%1", command: "zsh" }, { "%1": true }, "%1", ""),
+    "disconnected",
+  );
+});
+
+test("SSH connection state detects disconnect output in the selected pane log", () => {
+  const logText = "client_loop: send disconnect: Broken pipe\nConnection to host.example closed.";
+
+  assert.equal(hasSshDisconnectSignal(logText), true);
+  assert.equal(getPaneConnectionState({ paneId: "%1", command: "zsh" }, {}, "%1", logText), "disconnected");
+});
+
+test("SSH connection state ignores ordinary local panes", () => {
+  assert.equal(isSshCommand("node"), false);
+  assert.equal(getPaneConnectionState({ paneId: "%1", command: "node" }, {}, "%1", "npm test"), "none");
+});
+
+test("GET / includes SSH connection status indicators", async () => {
+  const server = createServer({
+    tmux: {
+      listPanes: async () => [],
+      capturePane: async () => "",
+    },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const response = await fetch(`${baseUrl}/`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /\.connection-dot/);
+    assert.match(html, /\.connection-connected/);
+    assert.match(html, /\.connection-disconnected/);
+    assert.match(html, /function renderConnectionDot/);
+    assert.match(html, /function getPaneConnectionState/);
   } finally {
     await close(server);
   }
